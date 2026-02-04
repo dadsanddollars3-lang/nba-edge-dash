@@ -1,5 +1,14 @@
+# app.py
+# NBA Edge Dash: Odds snapshots + baseline devig runs + bet logging
+# Fixes:
+# 1) Forces IPv4 sockets in Streamlit (common IPv6 routing failure)
+# 2) Correct parameterized SQL usage in load_latest_snapshots
+# 3) Adds safer connection handling and clearer error messages
+
 import os
 import hashlib
+import socket
+import ipaddress
 from datetime import datetime, timezone
 
 import requests
@@ -7,8 +16,6 @@ import pandas as pd
 import psycopg
 from psycopg.types.json import Json
 import streamlit as st
-import socket
-import ipaddress
 
 st.set_page_config(page_title="NBA Edge Dash", layout="wide")
 
@@ -21,7 +28,7 @@ def S(key: str, default=None):
 ODDS_API_KEY = S("ODDS_API_KEY")
 
 DB_HOST = S("DB_HOST")
-DB_HOSTADDR = S("DB_HOSTADDR")  # optional: hard-force IPv4 literal if you ever need it
+DB_HOSTADDR = S("DB_HOSTADDR")  # optional: force IPv4 literal
 DB_NAME = S("DB_NAME", "postgres")
 DB_USER = S("DB_USER", "postgres")
 DB_PASSWORD = S("DB_PASSWORD")
@@ -38,7 +45,7 @@ MODEL_ID = "BASELINE"
 MODEL_VERSION = S("MODEL_VERSION", "v1")
 
 # -----------------------
-# DB helpers
+# DB helpers (IPv4 enforced)
 # -----------------------
 def _is_ipv4_literal(x: str) -> bool:
     try:
@@ -48,14 +55,12 @@ def _is_ipv4_literal(x: str) -> bool:
 
 def _doh_lookup_a(host: str) -> str | None:
     """
-    DNS-over-HTTPS A-record lookup (IPv4) using public resolvers.
-    Returns first IPv4 if present, else None.
+    DNS-over-HTTPS A record lookup for an IPv4 address.
     """
     resolvers = [
         ("https://dns.google/resolve", {"name": host, "type": "A"}),
         ("https://cloudflare-dns.com/dns-query", {"name": host, "type": "A"}),
     ]
-
     for url, params in resolvers:
         try:
             headers = {}
@@ -75,22 +80,21 @@ def _doh_lookup_a(host: str) -> str | None:
 
 def _resolve_ipv4(host: str) -> str | None:
     """
-    Returns an IPv4 for host if any exists.
-    We *must* do this because Streamlit's runtime often can't route IPv6,
-    and Supabase/Pooler hostnames frequently resolve to AAAA first.
+    Return an IPv4 address for host if available.
+    We do this because Streamlit hosting often cannot route IPv6.
     """
     if not host:
         return None
 
-    # If user explicitly provided an IPv4 literal in DB_HOST, just use it.
+    # If DB_HOST itself is an IPv4 literal
     if _is_ipv4_literal(host):
         return host
 
-    # If user provided an explicit hostaddr override, use it.
+    # If override is provided
     if DB_HOSTADDR and _is_ipv4_literal(DB_HOSTADDR):
         return DB_HOSTADDR
 
-    # Try system resolver for A records only.
+    # System resolver for A records only
     try:
         infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
         if infos:
@@ -98,18 +102,27 @@ def _resolve_ipv4(host: str) -> str | None:
     except Exception:
         pass
 
-    # Fall back to DNS-over-HTTPS A lookup
+    # DoH fallback
     return _doh_lookup_a(host)
 
 def db_conn():
     if not all([DB_HOST, DB_USER, DB_PASSWORD, DB_NAME]):
-        raise RuntimeError("Missing DB credentials (DB_HOST/DB_USER/DB_PASSWORD/DB_NAME). Check Streamlit secrets.")
+        raise RuntimeError(
+            "Missing DB credentials. Require DB_HOST, DB_USER, DB_PASSWORD, DB_NAME in Streamlit secrets or env."
+        )
 
     ipv4 = _resolve_ipv4(DB_HOST)
+    if not ipv4:
+        raise RuntimeError(
+            f"Could not resolve an IPv4 A record for DB_HOST='{DB_HOST}'. "
+            "This Streamlit runtime cannot use IPv6 routes. "
+            "Set DB_HOSTADDR to an IPv4 literal or use an IPv4-capable pooler host."
+        )
 
-    # We keep 'host' for TLS/SNI; we set 'hostaddr' to force the IPv4 socket.
+    # Keep 'host' for TLS SNI, but force the socket to IPv4 via hostaddr
     conn_kwargs = dict(
         host=DB_HOST,
+        hostaddr=ipv4,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
@@ -117,17 +130,6 @@ def db_conn():
         sslmode="require",
         connect_timeout=12,
     )
-
-    if ipv4:
-        conn_kwargs["hostaddr"] = ipv4
-    else:
-        # If we cannot find an A-record at all, this will almost certainly fail in Streamlit.
-        # Raise a loud, clear error instead of mysterious psycopg IPv6 failures.
-        raise RuntimeError(
-            f"Could not resolve an IPv4 address (A record) for DB_HOST='{DB_HOST}'. "
-            f"Streamlit runtime here cannot use IPv6. Use an IPv4-capable host or set DB_HOSTADDR to an IPv4 literal."
-        )
-
     return psycopg.connect(**conn_kwargs)
 
 def run_sql(sql: str, params=None):
@@ -137,10 +139,6 @@ def run_sql(sql: str, params=None):
         conn.commit()
 
 def init_db():
-    """
-    Create tables if they don't exist.
-    This keeps your app from dying on a fresh DB.
-    """
     ddl = """
     create table if not exists events (
         event_id text primary key,
@@ -207,7 +205,7 @@ def init_db():
 # -----------------------
 def fetch_odds():
     if not ODDS_API_KEY:
-        raise RuntimeError("Missing ODDS_API_KEY")
+        raise RuntimeError("Missing ODDS_API_KEY in secrets or env.")
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds"
     params = {
         "regions": REGIONS,
@@ -244,8 +242,8 @@ def prob_to_american(p: float) -> int:
     if p <= 0 or p >= 1:
         return 0
     if p >= 0.5:
-        return int(round(-100 * p / (1 - p)))
-    return int(round(100 * (1 - p) / p))
+        return int(round(-100.0 * p / (1.0 - p)))
+    return int(round(100.0 * (1.0 - p) / p))
 
 # -----------------------
 # Load latest snapshots
@@ -273,6 +271,7 @@ def load_latest_snapshots(lookback_hours: int) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
     df["line"] = pd.to_numeric(df["line"], errors="coerce")
+    df["price_american"] = pd.to_numeric(df["price_american"], errors="coerce").astype("Int64")
     return df
 
 def latest_per_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -300,17 +299,20 @@ def create_run(inputs_hash: str, notes: str = "") -> int:
 def store_model_outputs(run_id: int, df_outputs: pd.DataFrame):
     if df_outputs.empty:
         return
+
     rows = []
     for _, r in df_outputs.iterrows():
-        rows.append((
-            run_id,
-            r["event_id"],
-            r["market"],
-            r["selection"],
-            None if pd.isna(r["line"]) else float(r["line"]),
-            float(r["p_fair"]),
-            int(r["fair_price_american"]),
-        ))
+        rows.append(
+            (
+                int(run_id),
+                str(r["event_id"]),
+                str(r["market"]),
+                str(r["selection"]),
+                None if pd.isna(r["line"]) else float(r["line"]),
+                float(r["p_fair"]),
+                int(r["fair_price_american"]),
+            )
+        )
 
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -319,7 +321,7 @@ def store_model_outputs(run_id: int, df_outputs: pd.DataFrame):
                 insert into model_outputs(run_id, event_id, market, selection, line, p_fair, fair_price_american)
                 values (%s,%s,%s,%s,%s,%s,%s)
                 """,
-                rows
+                rows,
             )
         conn.commit()
 
@@ -335,6 +337,7 @@ def load_recent_runs(limit: int = 10) -> pd.DataFrame:
             cur.execute(q, (int(limit),))
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
+
     df = pd.DataFrame(rows, columns=cols)
     if not df.empty:
         df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
@@ -344,54 +347,91 @@ def load_recent_runs(limit: int = 10) -> pd.DataFrame:
 # Baseline model
 # -----------------------
 def build_baseline_outputs(df_latest: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each (event_id, market, line), devig each book's 2-way market and average fair probs across books.
+    """
     rows = []
     group_cols = ["event_id", "market", "line"]
+
     for (event_id, market, line), g in df_latest.groupby(group_cols):
         per_book = []
         for book, gb in g.groupby("book"):
             outs = gb[["selection", "price_american"]].drop_duplicates()
             if len(outs) != 2:
                 continue
-            sel1, o1 = outs.iloc[0]["selection"], int(outs.iloc[0]["price_american"])
-            sel2, o2 = outs.iloc[1]["selection"], int(outs.iloc[1]["price_american"])
+
+            sel1 = str(outs.iloc[0]["selection"])
+            sel2 = str(outs.iloc[1]["selection"])
+            o1 = int(outs.iloc[0]["price_american"])
+            o2 = int(outs.iloc[1]["price_american"])
+
             p1, p2 = american_to_prob(o1), american_to_prob(o2)
             p1f, p2f = devig_two_way(p1, p2)
-            per_book.append((sel1, p1f))
-            per_book.append((sel2, p2f))
+
+            if pd.isna(p1f) or pd.isna(p2f):
+                continue
+
+            per_book.append((sel1, float(p1f)))
+            per_book.append((sel2, float(p2f)))
 
         if not per_book:
             continue
 
         dfb = pd.DataFrame(per_book, columns=["selection", "p_book_fair"])
         base = dfb.groupby("selection", as_index=False)["p_book_fair"].mean()
+
         for _, r in base.iterrows():
             p = float(r["p_book_fair"])
-            rows.append([event_id, market, line, r["selection"], p, prob_to_american(p)])
+            rows.append(
+                [
+                    str(event_id),
+                    str(market),
+                    None if pd.isna(line) else float(line),
+                    str(r["selection"]),
+                    p,
+                    prob_to_american(p),
+                ]
+            )
 
-    return pd.DataFrame(rows, columns=["event_id", "market", "line", "selection", "p_fair", "fair_price_american"])
+    return pd.DataFrame(
+        rows,
+        columns=["event_id", "market", "line", "selection", "p_fair", "fair_price_american"],
+    )
 
 # -----------------------
 # Bet logging
 # -----------------------
-def insert_bet(book: str, bet_type: str, event_id: str, bet_ts: datetime,
-               model_id: str, model_version: str, run_id: int,
-               legs_json: dict, stake: float, price_taken_american: int,
-               p_fair_at_bet: float, edge_at_bet: float):
+def insert_bet(
+    book: str,
+    bet_type: str,
+    event_id: str,
+    bet_ts: datetime,
+    model_id: str,
+    model_version: str,
+    run_id: int,
+    legs_json: dict,
+    stake: float,
+    price_taken_american: int,
+    p_fair_at_bet: float,
+    edge_at_bet: float,
+):
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                insert into bets(book, bet_type, event_id, bet_ts, model_id, model_version, run_id,
-                                 legs_json, stake, price_taken_american, p_fair_at_bet, edge_at_bet)
+                insert into bets(
+                    book, bet_type, event_id, bet_ts, model_id, model_version, run_id,
+                    legs_json, stake, price_taken_american, p_fair_at_bet, edge_at_bet
+                )
                 values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
-                    book,
-                    bet_type,
-                    event_id,
-                    bet_ts.isoformat(),
-                    model_id,
-                    model_version,
+                    str(book),
+                    str(bet_type),
+                    str(event_id),
+                    bet_ts,  # pass datetime directly
+                    str(model_id),
+                    str(model_version),
                     int(run_id),
                     Json(legs_json),
                     float(stake),
@@ -414,8 +454,8 @@ except Exception as e:
 # -----------------------
 # UI
 # -----------------------
-st.title("NBA Edge Dash (V1) — Odds Spine + Runs + Bet Attribution")
-st.caption("V1 is the plumbing: odds snapshots, baseline devig run outputs, and bet logging with model/run tags. Your quantile + simulation models come next.")
+st.title("NBA Edge Dash (V1)")
+st.caption("Odds snapshots, baseline devig run outputs, and bet logging with model/run tags.")
 
 col1, col2, col3, col4 = st.columns([1.1, 1, 1, 1.2])
 
@@ -432,6 +472,7 @@ with col1:
                         home = ev.get("home_team")
                         away = ev.get("away_team")
                         start_time = ev.get("commence_time")
+
                         if not all([event_id, home, away, start_time]):
                             continue
 
@@ -450,16 +491,20 @@ with col1:
 
                         for bm in ev.get("bookmakers", []):
                             book = normalize_book(bm)
+
                             for mkt in bm.get("markets", []):
                                 mk = mkt.get("key")
                                 if mk not in ["h2h", "spreads", "totals"]:
                                     continue
+
                                 for out in mkt.get("outcomes", []):
                                     name = out.get("name")
                                     price = out.get("price")
                                     point = out.get("point", None)
+
                                     if name is None or price is None:
                                         continue
+
                                     cur.execute(
                                         """
                                         insert into odds_snapshots(event_id, book, market, selection, line, price_american)
@@ -489,39 +534,47 @@ with col4:
                 st.warning("No snapshots yet. Click Update Odds Now first.")
             else:
                 dfL = latest_per_key(df)
+
                 h = hashlib.sha256(
                     pd.util.hash_pandas_object(
                         dfL[["event_id", "book", "market", "selection", "line", "price_american"]],
-                        index=False
+                        index=False,
                     ).values.tobytes()
                 ).hexdigest()
 
                 run_id = create_run(inputs_hash=h, notes=f"Baseline devig from last {lookback_hours}h")
                 outputs = build_baseline_outputs(dfL)
                 store_model_outputs(run_id, outputs)
+
                 st.success(f"Created run_id={run_id} and stored {len(outputs)} baseline outputs.")
         except Exception as e:
             st.error(f"Run generation failed: {e}")
 
+# -----------------------
 # Data display
+# -----------------------
 df = load_latest_snapshots(int(lookback_hours))
 if df.empty:
-    st.info("No odds snapshots yet. Click **Update Odds Now**.")
+    st.info("No odds snapshots yet. Click Update Odds Now.")
     st.stop()
 
 dfL = latest_per_key(df)
 
-st.subheader("Latest Odds (raw snapshots, latest per key)")
-st.dataframe(dfL.sort_values(["start_time", "event_id", "market", "book"]), use_container_width=True, height=320)
+st.subheader("Latest Odds (latest per key)")
+st.dataframe(
+    dfL.sort_values(["start_time", "event_id", "market", "book"]),
+    use_container_width=True,
+    height=320,
+)
 
-st.subheader("Latest Run Outputs (Baseline for now)")
+st.subheader("Latest Run Outputs (Baseline)")
 runs_df = load_recent_runs(limit=10)
 if runs_df.empty:
-    st.info("No runs yet. Click **Generate Baseline Run**.")
+    st.info("No runs yet. Click Generate Baseline Run.")
     st.stop()
 
 latest_run = int(runs_df.iloc[0]["run_id"])
-st.caption(f"Showing outputs for latest run_id={latest_run}. (In V2, this becomes your quantile/simulation model run.)")
+st.caption(f"Showing outputs for latest run_id={latest_run}.")
 
 q_out = """
 select mo.run_id, mo.event_id, e.start_time, e.away_team, e.home_team,
@@ -538,71 +591,124 @@ with db_conn() as conn:
         cols = [d[0] for d in cur.description]
         out_df = pd.DataFrame(cur.fetchall(), columns=cols)
 
-out_df["start_time"] = pd.to_datetime(out_df["start_time"], utc=True)
-
 if out_df.empty:
-    st.warning("Latest run has no outputs yet (need enough 2-way markets).")
+    st.warning("Latest run has no outputs yet. Need enough 2-way markets per event.")
     st.stop()
+
+out_df["start_time"] = pd.to_datetime(out_df["start_time"], utc=True)
+out_df["line"] = pd.to_numeric(out_df["line"], errors="coerce")
 
 best_prices = dfL[dfL["book"].isin(target_books)].copy()
 bp = best_prices.groupby(["event_id", "market", "line", "selection", "book"], as_index=False)["price_american"].max()
 merged = out_df.merge(bp, on=["event_id", "market", "line", "selection"], how="left")
 
 st.dataframe(
-    merged[["start_time", "away_team", "home_team", "market", "line", "selection", "p_fair", "fair_price_american", "book", "price_american"]],
+    merged[
+        [
+            "start_time",
+            "away_team",
+            "home_team",
+            "market",
+            "line",
+            "selection",
+            "p_fair",
+            "fair_price_american",
+            "book",
+            "price_american",
+        ]
+    ],
     use_container_width=True,
     height=360,
 )
 
+# -----------------------
+# Quick Log Bet
+# -----------------------
 st.subheader("Quick Log Bet (auto-tags model/run)")
-st.caption("Use this when you click a recommendation and want it attributed automatically. Works for on-the-fly logging too.")
+st.caption("Select an output row to prefill, then log your bet with run attribution.")
 
 with st.form("log_bet_form"):
-    cols = st.columns([1.2, 1, 1, 1, 1])
-    event_id = cols[0].selectbox("Event", options=sorted(out_df["event_id"].unique()))
-    book = cols[1].selectbox("Book", options=target_books)
-    bet_type = cols[2].selectbox("Bet type", options=["straight", "sgp_2leg"])
-    stake = cols[3].number_input("Stake", min_value=1.0, value=10.0, step=1.0)
-    bet_ts = cols[4].text_input("Bet time (optional)", value="now")
+    c = st.columns([1.2, 1, 1, 1, 1])
+
+    event_id = c[0].selectbox("Event", options=sorted(out_df["event_id"].unique()))
+    book = c[1].selectbox("Book", options=target_books)
+    bet_type = c[2].selectbox("Bet type", options=["straight", "sgp_2leg"])
+    stake = c[3].number_input("Stake", min_value=1.0, value=10.0, step=1.0)
+    bet_ts = c[4].text_input("Bet time (optional ISO8601 or 'now')", value="now")
 
     ev_rows = out_df[out_df["event_id"] == event_id].copy()
-    labels = list(ev_rows.apply(lambda r: f"{r['market']} | line={r['line']} | {r['selection']} | p={r['p_fair']:.3f}", axis=1))
-    leg_pick = st.selectbox("Pick a market/selection (from latest run outputs) to prefill leg", options=labels)
+    labels = list(
+        ev_rows.apply(
+            lambda r: f"{r['market']} | line={r['line']} | {r['selection']} | p={float(r['p_fair']):.3f}",
+            axis=1,
+        )
+    )
+
+    leg_pick = st.selectbox("Pick a market/selection (from latest run outputs)", options=labels)
     picked = ev_rows.iloc[labels.index(leg_pick)]
 
     price_taken = st.number_input("Price taken (American)", value=-110, step=1)
 
     submit = st.form_submit_button("Save Bet")
     if submit:
-        if bet_ts.strip().lower() == "now" or bet_ts.strip() == "":
+        if bet_ts.strip().lower() in ["now", ""]:
             bt = datetime.now(timezone.utc)
         else:
             try:
-                bt = datetime.fromisoformat(bet_ts).astimezone(timezone.utc)
+                # fromisoformat can parse "YYYY-MM-DDTHH:MM:SS+00:00"
+                bt = datetime.fromisoformat(bet_ts)
+                if bt.tzinfo is None:
+                    bt = bt.replace(tzinfo=timezone.utc)
+                else:
+                    bt = bt.astimezone(timezone.utc)
             except Exception:
                 bt = datetime.now(timezone.utc)
 
-        legs = [{
-            "market": str(picked["market"]),
-            "selection": str(picked["selection"]),
-            "line": None if pd.isna(picked["line"]) else float(picked["line"]),
-        }]
+        legs = [
+            {
+                "market": str(picked["market"]),
+                "selection": str(picked["selection"]),
+                "line": None if pd.isna(picked["line"]) else float(picked["line"]),
+            }
+        ]
 
         p_fair = float(picked["p_fair"])
-        edge = 0.0
+        edge = 0.0  # placeholder, compute later if you want
 
-        insert_bet(
-            book=book,
-            bet_type=bet_type,
-            event_id=event_id,
-            bet_ts=bt,
-            model_id=MODEL_ID,
-            model_version=MODEL_VERSION,
-            run_id=latest_run,
-            legs_json={"legs": legs},
-            stake=float(stake),
-            price_taken_american=int(price_taken),
-            p_fair_at_bet=p_fair,
-            edge_at_bet=edge
+        try:
+            insert_bet(
+                book=book,
+                bet_type=bet_type,
+                event_id=str(event_id),
+                bet_ts=bt,
+                model_id=MODEL_ID,
+                model_version=MODEL_VERSION,
+                run_id=latest_run,
+                legs_json={"legs": legs},
+                stake=float(stake),
+                price_taken_american=int(price_taken),
+                p_fair_at_bet=p_fair,
+                edge_at_bet=edge,
+            )
+            st.success("Bet logged with automatic model/run attribution.")
+        except Exception as e:
+            st.error(f"Bet insert failed: {e}")
+
+# -----------------------
+# Footer: Diagnostics
+# -----------------------
+with st.expander("DB Diagnostic (shows resolved IPv4)"):
+    try:
+        ipv4 = _resolve_ipv4(DB_HOST) if DB_HOST else None
+        st.write(
+            {
+                "DB_HOST": DB_HOST,
+                "DB_HOSTADDR_override": DB_HOSTADDR,
+                "resolved_ipv4": ipv4,
+                "DB_NAME": DB_NAME,
+                "DB_USER": DB_USER,
+                "DB_PORT": DB_PORT,
+            }
         )
-        st.success("Bet logged with automatic model/run attribution.")
+    except Exception as e:
+        st.error(str(e))
