@@ -38,7 +38,12 @@ MODEL_VERSION = S("MODEL_VERSION", "v1")  # set to git hash later if you want
 # -----------------------
 def db_conn():
     return psycopg.connect(
-        host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT
+        host=DB_HOST,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        port=DB_PORT,
+        sslmode="require",
     )
 
 def run_sql(sql: str, params=None):
