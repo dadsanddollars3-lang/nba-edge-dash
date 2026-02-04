@@ -97,12 +97,15 @@ def prob_to_american(p: float) -> int:
 # -----------------------
 # Load latest snapshots
 # -----------------------
-def load_recent_runs(limit=20) -> pd.DataFrame:
+def load_latest_snapshots(lookback_hours: int) -> pd.DataFrame:
     q = f"""
-    select run_id, run_ts, model_id, model_version, notes, inputs_hash
-    from runs
-    order by run_ts desc
-    limit {int(limit)}
+    select s.ts, e.start_time, e.home_team, e.away_team,
+           s.event_id, s.book, s.market, s.selection, s.line, s.price_american
+    from odds_snapshots s
+    join events e on e.event_id = s.event_id
+    where s.ts >= now() - interval '{lookback_hours} hours'
+    order by s.ts desc
+    limit 30000
     """
     conn = db_conn()
     with conn.cursor() as cur:
@@ -110,9 +113,14 @@ def load_recent_runs(limit=20) -> pd.DataFrame:
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
     conn.close()
+
     df = pd.DataFrame(rows, columns=cols)
-    if not df.empty:
-        df["run_ts"] = pd.to_datetime(df["run_ts"], utc=True)
+    if df.empty:
+        return df
+
+    df["ts"] = pd.to_datetime(df["ts"], utc=True)
+    df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
+    df["line"] = pd.to_numeric(df["line"], errors="coerce")
     return df
 
 def latest_per_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -225,19 +233,7 @@ def insert_bet(book: str, bet_type: str, event_id: str, bet_ts: datetime,
     cur.close()
     conn.close()
 
-def load_recent_runs(limit=20) -> pd.DataFrame:
-    q = f"""
-    select run_id, run_ts, model_id, model_version, notes, inputs_hash
-    from runs
-    order by run_ts desc
-    limit {int(limit)}
-    """
-    conn = db_conn()
-    df = pd.read_sql(q, conn)
-    conn.close()
-    if not df.empty:
-        df["run_ts"] = pd.to_datetime(df["run_ts"], utc=True)
-    return df
+
 
 # -----------------------
 # UI
