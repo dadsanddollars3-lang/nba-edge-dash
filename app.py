@@ -74,7 +74,20 @@ def _parse_database_url(url: str) -> dict:
     dbname = (u.path or "").lstrip("/")
     if not all([host, user, password, dbname]):
         raise RuntimeError("DATABASE_URL missing host/user/password/dbname.")
-    return {"host": host.strip(), "port": int(port), "dbname": dbname, "user": user, "password": password, "url": url}
+    
+    # Parse sslmode from query string
+    qs = parse_qs(u.query)
+    sslmode = qs.get("sslmode", ["require"])[0]
+    
+    return {
+        "host": host.strip(), 
+        "port": int(port), 
+        "dbname": dbname, 
+        "user": user, 
+        "password": password, 
+        "sslmode": sslmode,
+        "url": url
+    }
 
 # =======================
 # IPv4 forcing
@@ -139,25 +152,16 @@ def _db_plan():
 def db_conn():
     cfg, ipv4 = _db_plan()
     
-    # Build a new connection string with the resolved IPv4 address
-    # Parse the original URL to get query parameters
-    u = urlparse(cfg["url"])
-    
-    # Reconstruct the URL with IPv4 address instead of hostname
-    # Keep the original hostname for TLS/SNI verification
-    new_url = urlunparse((
-        u.scheme,
-        f"{cfg['user']}:{cfg['password']}@{ipv4}:{cfg['port']}",
-        f"/{cfg['dbname']}",
-        u.params,
-        u.query,
-        u.fragment
-    ))
-    
-    # Connect using the IPv4-based URL, but pass the original hostname for TLS
+    # Use psycopg's native connection parameters
+    # hostaddr forces IPv4 connection while host preserves TLS hostname
     return psycopg.connect(
-        new_url,
-        host=cfg["host"],  # For TLS/SNI
+        dbname=cfg["dbname"],
+        user=cfg["user"],
+        password=cfg["password"],
+        host=cfg["host"],      # Original hostname for TLS/SNI
+        hostaddr=ipv4,          # Resolved IPv4 for actual connection
+        port=cfg["port"],
+        sslmode=cfg["sslmode"],
         connect_timeout=12,
     )
 
