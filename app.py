@@ -37,24 +37,33 @@ MODEL_VERSION = S("MODEL_VERSION", "v1")  # set to git hash later if you want
 # -----------------------
 # DB helpers
 # -----------------------
-def db_conn():
-    # Force IPv4 resolution (Streamlit Cloud may fail on IPv6 egress)
-    host = DB_HOST
+def _resolve_ipv4(host: str) -> str | None:
     try:
-        ipv4 = socket.getaddrinfo(DB_HOST, DB_PORT, socket.AF_INET)[0][4][0]
-        host = ipv4
+        infos = socket.getaddrinfo(host, DB_PORT, socket.AF_INET, socket.SOCK_STREAM)
+        return infos[0][4][0] if infos else None
     except Exception:
-        # If IPv4 lookup fails, fall back to whatever DB_HOST is
-        host = DB_HOST
+        return None
 
-    return psycopg.connect(
-        host=host,
+def db_conn():
+    if not all([DB_HOST, DB_USER, DB_PASSWORD]):
+        raise RuntimeError("Missing DB credentials in secrets/env vars")
+
+    ipv4 = _resolve_ipv4(DB_HOST)
+
+    conn_kwargs = dict(
+        host=DB_HOST,           # hostname for TLS/SNI
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
         port=DB_PORT,
         sslmode="require",
+        connect_timeout=10,
     )
+
+    if ipv4:
+        conn_kwargs["hostaddr"] = ipv4  # force IPv4 socket
+
+    return psycopg.connect(**conn_kwargs)
 
 def run_sql(sql: str, params=None):
     conn = db_conn()
