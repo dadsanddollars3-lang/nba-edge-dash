@@ -31,7 +31,7 @@ DB_PORT = "5432"
 DB_NAME = "postgres"
 DB_USER = "postgres.koorfwagibchkrhcdqhi"
 DB_PASSWORD = "PASTE_YOUR_ROTATED_PASSWORD_HERE"
-
+DB_HOSTADDR = "A.B.C.D"
 # Optional: only set this if IPv4 resolution still fails in Streamlit
 # DB_HOSTADDR = "A.B.C.D"
 
