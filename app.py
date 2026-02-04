@@ -22,27 +22,18 @@ st.set_page_config(page_title="NBA Edge Dash", layout="wide")
 # -----------------------
 # Secrets / Config
 # -----------------------
-def S(key: str, default=None):
-    return st.secrets.get(key, os.environ.get(key, default))
+# .streamlit/secrets.toml
 
-ODDS_API_KEY = S("ODDS_API_KEY")
+ODDS_API_KEY = "YOUR_ODDS_API_KEY"
 
-DB_HOST = S("DB_HOST")
-DB_HOSTADDR = S("DB_HOSTADDR")  # optional: force IPv4 literal
-DB_NAME = S("DB_NAME", "postgres")
-DB_USER = S("DB_USER", "postgres")
-DB_PASSWORD = S("DB_PASSWORD")
-DB_PORT = int(S("DB_PORT", 5432))
+DB_HOST = "aws-0-us-west-2.pooler.supabase.com"
+DB_PORT = "5432"
+DB_NAME = "postgres"
+DB_USER = "postgres.koorfwagibchkrhcdqhi"
+DB_PASSWORD = "PASTE_YOUR_ROTATED_PASSWORD_HERE"
 
-SPORT_KEY = "basketball_nba"
-REGIONS = "us"
-MARKETS = "h2h,spreads,totals"
-ODDS_FORMAT = "american"
-
-TARGET_BOOKS = ["betonlineag", "caesars"]
-
-MODEL_ID = "BASELINE"
-MODEL_VERSION = S("MODEL_VERSION", "v1")
+# Optional: only set this if IPv4 resolution still fails in Streamlit
+# DB_HOSTADDR = "A.B.C.D"
 
 # -----------------------
 # DB helpers (IPv4 enforced)
