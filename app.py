@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 import requests
 import pandas as pd
-import psycopg2
+import psycopg
 import streamlit as st
 
 st.set_page_config(page_title="NBA Edge Dash", layout="wide")
@@ -37,7 +37,7 @@ MODEL_VERSION = S("MODEL_VERSION", "v1")  # set to git hash later if you want
 # DB helpers
 # -----------------------
 def db_conn():
-    return psycopg2.connect(
+    return psycopg.connect(
         host=DB_HOST, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD, port=DB_PORT
     )
 
@@ -97,24 +97,22 @@ def prob_to_american(p: float) -> int:
 # -----------------------
 # Load latest snapshots
 # -----------------------
-def load_latest_snapshots(lookback_hours: int) -> pd.DataFrame:
+def load_recent_runs(limit=20) -> pd.DataFrame:
     q = f"""
-    select s.ts, e.start_time, e.home_team, e.away_team,
-           s.event_id, s.book, s.market, s.selection, s.line, s.price_american
-    from odds_snapshots s
-    join events e on e.event_id = s.event_id
-    where s.ts >= now() - interval '{lookback_hours} hours'
-    order by s.ts desc
-    limit 30000
+    select run_id, run_ts, model_id, model_version, notes, inputs_hash
+    from runs
+    order by run_ts desc
+    limit {int(limit)}
     """
     conn = db_conn()
-    df = pd.read_sql(q, conn)
+    with conn.cursor() as cur:
+        cur.execute(q)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
     conn.close()
-    if df.empty:
-        return df
-    df["ts"] = pd.to_datetime(df["ts"], utc=True)
-    df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
-    df["line"] = pd.to_numeric(df["line"], errors="coerce")
+    df = pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df["run_ts"] = pd.to_datetime(df["run_ts"], utc=True)
     return df
 
 def latest_per_key(df: pd.DataFrame) -> pd.DataFrame:
@@ -357,7 +355,10 @@ where mo.run_id = {latest_run}
 order by e.start_time, mo.event_id, mo.market, mo.line, mo.selection
 """
 conn = db_conn()
-out_df = pd.read_sql(q_out, conn)
+with conn.cursor() as cur:
+    cur.execute(q_out)
+    cols = [d[0] for d in cur.description]
+    out_df = pd.DataFrame(cur.fetchall(), columns=cols)
 conn.close()
 out_df["start_time"] = pd.to_datetime(out_df["start_time"], utc=True)
 
