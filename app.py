@@ -138,11 +138,26 @@ def _db_plan():
 
 def db_conn():
     cfg, ipv4 = _db_plan()
-    # keep host for TLS/SNI; force socket with hostaddr
+    
+    # Build a new connection string with the resolved IPv4 address
+    # Parse the original URL to get query parameters
+    u = urlparse(cfg["url"])
+    
+    # Reconstruct the URL with IPv4 address instead of hostname
+    # Keep the original hostname for TLS/SNI verification
+    new_url = urlunparse((
+        u.scheme,
+        f"{cfg['user']}:{cfg['password']}@{ipv4}:{cfg['port']}",
+        f"/{cfg['dbname']}",
+        u.params,
+        u.query,
+        u.fragment
+    ))
+    
+    # Connect using the IPv4-based URL, but pass the original hostname for TLS
     return psycopg.connect(
-        cfg["url"],
-        host=cfg["host"],
-        hostaddr=ipv4,
+        new_url,
+        host=cfg["host"],  # For TLS/SNI
         connect_timeout=12,
     )
 
