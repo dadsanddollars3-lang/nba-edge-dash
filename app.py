@@ -529,49 +529,54 @@ with col4:
         except Exception as e:
             st.error(f"Run generation failed: {e}")
 
-df = load_latest_snapshots(int(lookback_hours))
-if df.empty:
-    st.info("No odds snapshots yet. Click **Update Odds Now**.")
-    st.stop()
+# Only try to load and display data if we can connect
+try:
+    df = load_latest_snapshots(int(lookback_hours))
+    
+    if df.empty:
+        st.info("No odds snapshots yet. Click **Update Odds Now** to fetch data from the API.")
+    else:
+        dfL = latest_per_key(df)
+        st.subheader("Latest Odds (latest per key)")
+        st.dataframe(dfL.sort_values(["start_time", "event_id", "market", "book"]), use_container_width=True, height=320)
 
-dfL = latest_per_key(df)
-st.subheader("Latest Odds (latest per key)")
-st.dataframe(dfL.sort_values(["start_time", "event_id", "market", "book"]), use_container_width=True, height=320)
+        runs_df = load_recent_runs(limit=10)
+        st.subheader("Latest Run Outputs (Baseline)")
+        
+        if runs_df.empty:
+            st.info("No runs yet. Click **Generate Baseline Run** to create model outputs.")
+        else:
+            latest_run = int(runs_df.iloc[0]["run_id"])
+            q_out = """
+            select mo.run_id, mo.event_id, e.start_time, e.away_team, e.home_team,
+                   mo.market, mo.line, mo.selection, mo.p_fair, mo.fair_price_american
+            from model_outputs mo
+            join events e on e.event_id = mo.event_id
+            where mo.run_id = %s
+            order by e.start_time, mo.event_id, mo.market, mo.line, mo.selection
+            """
+            with db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(q_out, (latest_run,))
+                    cols = [d[0] for d in cur.description]
+                    out_df = pd.DataFrame(cur.fetchall(), columns=cols)
 
-runs_df = load_recent_runs(limit=10)
-st.subheader("Latest Run Outputs (Baseline)")
-if runs_df.empty:
-    st.info("No runs yet. Click **Generate Baseline Run**.")
-    st.stop()
+            if out_df.empty:
+                st.warning("Latest run has no outputs yet (need enough 2-way markets).")
+            else:
+                out_df["start_time"] = pd.to_datetime(out_df["start_time"], utc=True)
+                best_prices = dfL[dfL["book"].isin(target_books)].copy()
+                bp = best_prices.groupby(["event_id", "market", "line", "selection", "book"], as_index=False)["price_american"].max()
+                merged = out_df.merge(bp, on=["event_id", "market", "line", "selection"], how="left")
+                st.dataframe(
+                    merged[["start_time", "away_team", "home_team", "market", "line", "selection", "p_fair", "fair_price_american", "book", "price_american"]],
+                    use_container_width=True,
+                    height=360,
+                )
 
-latest_run = int(runs_df.iloc[0]["run_id"])
-q_out = """
-select mo.run_id, mo.event_id, e.start_time, e.away_team, e.home_team,
-       mo.market, mo.line, mo.selection, mo.p_fair, mo.fair_price_american
-from model_outputs mo
-join events e on e.event_id = mo.event_id
-where mo.run_id = %s
-order by e.start_time, mo.event_id, mo.market, mo.line, mo.selection
-"""
-with db_conn() as conn:
-    with conn.cursor() as cur:
-        cur.execute(q_out, (latest_run,))
-        cols = [d[0] for d in cur.description]
-        out_df = pd.DataFrame(cur.fetchall(), columns=cols)
-
-if out_df.empty:
-    st.warning("Latest run has no outputs yet (need enough 2-way markets).")
-    st.stop()
-
-out_df["start_time"] = pd.to_datetime(out_df["start_time"], utc=True)
-best_prices = dfL[dfL["book"].isin(target_books)].copy()
-bp = best_prices.groupby(["event_id", "market", "line", "selection", "book"], as_index=False)["price_american"].max()
-merged = out_df.merge(bp, on=["event_id", "market", "line", "selection"], how="left")
-st.dataframe(
-    merged[["start_time", "away_team", "home_team", "market", "line", "selection", "p_fair", "fair_price_american", "book", "price_american"]],
-    use_container_width=True,
-    height=360,
-)
+except Exception as e:
+    st.warning(f"Could not load data: {e}")
+    st.info("This is normal on first run. Click **Update Odds Now** to populate the database.")
 
 with st.expander("DB Diagnostics (safe)"):
     try:
