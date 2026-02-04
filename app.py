@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import psycopg
 import streamlit as st
+import socket
 
 st.set_page_config(page_title="NBA Edge Dash", layout="wide")
 
@@ -37,8 +38,17 @@ MODEL_VERSION = S("MODEL_VERSION", "v1")  # set to git hash later if you want
 # DB helpers
 # -----------------------
 def db_conn():
+    # Force IPv4 resolution (Streamlit Cloud may fail on IPv6 egress)
+    host = DB_HOST
+    try:
+        ipv4 = socket.getaddrinfo(DB_HOST, DB_PORT, socket.AF_INET)[0][4][0]
+        host = ipv4
+    except Exception:
+        # If IPv4 lookup fails, fall back to whatever DB_HOST is
+        host = DB_HOST
+
     return psycopg.connect(
-        host=DB_HOST,
+        host=host,
         dbname=DB_NAME,
         user=DB_USER,
         password=DB_PASSWORD,
